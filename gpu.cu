@@ -43,9 +43,9 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
 __global__ void compute_forces_gpu(particle_t* parts, ListNode** bin_heads, ListNode** bin_tails, int num_parts, double size, int NUM_BLOCKS) {
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = blockDim.x * gridDim.x;
+    int steps = blockDim.x * gridDim.x;
 
-    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += stride) {
+    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += steps) {
 
         // Initialize acceleration to 0
         parts[loc_tid].ax = parts[loc_tid].ay = 0;
@@ -77,9 +77,9 @@ __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
 
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = blockDim.x * gridDim.x;
+    int steps = blockDim.x * gridDim.x;
 
-    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += stride) {
+    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += steps) {
 
         particle_t* p = &particles[loc_tid];
         //
@@ -109,10 +109,10 @@ __global__ void initialize_linked_lists(ListNode** bin_heads, ListNode** bin_tai
 
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = blockDim.x * gridDim.x;
+    int steps = blockDim.x * gridDim.x;
 
     // Initialize bin_heads and bin_tails to nullptr
-    for (int loc_tid = tid; loc_tid < num_bins; loc_tid += stride) {
+    for (int loc_tid = tid; loc_tid < num_bins; loc_tid += steps) {
         bin_heads[loc_tid] = nullptr;
         bin_tails[loc_tid] = nullptr;
     }
@@ -122,9 +122,9 @@ __global__ void insert_into_linked_list(ListNode** bin_heads, ListNode** bin_tai
 
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = blockDim.x * gridDim.x;
+    int steps = blockDim.x * gridDim.x;
 
-    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += stride) {
+    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += steps) {
         int bin_id = bin_ids[loc_tid];
         int particle_index = particle_indices[loc_tid];
 
@@ -146,9 +146,9 @@ __global__ void insert_into_linked_list(ListNode** bin_heads, ListNode** bin_tai
 __global__ void compute_bin_ids(particle_t* parts, int* bin_ids, int num_parts, double size, int NUM_BLOCKS) {
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int stride = blockDim.x * gridDim.x;
+    int steps = blockDim.x * gridDim.x;
 
-    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += stride) {
+    for (int loc_tid = tid; loc_tid < num_parts; loc_tid += steps) {
         // Get what row and column the particle would be in, with padding
         int dx = (parts[loc_tid].x * NUM_BLOCKS / size) + 1;
         int dy = (parts[loc_tid].y * NUM_BLOCKS / size) + 1;
@@ -167,7 +167,7 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
 
     // num blocks in either x or y direction (+2 in each dimension for padding)
     NUM_BLOCKS = size / cutoff;
-    tot_num_bins = (NUM_BLOCKS + 2) * (NUM_BLOCKS + 2);
+    tot_num_bins = (NUM_BLOCKS) * (NUM_BLOCKS);
 
     // Allocate memory for bin_heads and bin_tails on the GPU
     cudaMalloc((void**)&bin_heads, tot_num_bins * sizeof(ListNode*));
