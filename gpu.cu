@@ -8,24 +8,18 @@
 
 // Put any static global variables here that you will use throughout the simulation.
 int blks;
+static int bin_per_row; 
+int num_bins;
 
-static int ROW_BLOCKS;
-int binCount;
-
-// Define a struct for linked list nodes
-struct ListNode {
-    int particle_index;
-    ListNode* next;
-};
-
-// Initialize arrays for particle ids and bin ids
-ListNode** bin_heads;
-ListNode** bin_tails;
+// Initialize long arrays for particle and bins 
+int* bin_ids; // store the index of the first particle in this bin 
+int* particle_ids;  // stores all the particles in a array 
+int* bin_counts; // store the number of particles in each bin
 
 __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
-    double del_x = neighbor.x - particle.x;
-    double del_y = neighbor.y - particle.y;
-    double r2 = del_x * del_x + del_y * del_y;
+    double dx = neighbor.x - particle.x;
+    double dy = neighbor.y - particle.y;
+    double r2 = dx * dx + dy * dy;
     if (r2 > cutoff * cutoff)
         return;
     // r2 = fmax( r2, min_r*min_r );
@@ -36,40 +30,20 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     //  very simple short-range repulsive force
     //
     double coef = (1 - cutoff / r) / r2 / mass;
-    particle.ax += coef * del_x;
-    particle.ay += coef * del_y;
+    particle.ax += coef * dx;
+    particle.ay += coef * dy;
 }
 
-__global__ void compute_forces_gpu(particle_t* particles, ListNode** bin_heads, ListNode** bin_tails, int num_parts, double size, int ROW_BLOCKS) {
+__global__ void compute_forces_gpu(particle_t* particles, int num_parts) {
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps = blockDim.x * gridDim.x;
+    if (tid >= num_parts)
+        return; 
 
-    for (int i = tid; i < num_parts; i += steps) {
-
-        // Initialize acceleration to 0
-        particles[i].ax = particles[i].ay = 0;
-
-        // Get what row and column the particle would be in
-        int del_x = (particles[i].x * ROW_BLOCKS / size) + 1;
-        int del_y = (particles[i].y * ROW_BLOCKS / size) + 1;
-
-        // Iterate through the 3x3 neighboring bins
-        for (int j = -1; j <= 1; j++) {
-            for (int k = -1; k <= 1; k++) {
-
-                // Get the bin_id of the neighboring bin
-                int neighbor_id = del_x + j + (ROW_BLOCKS + 2) * (del_y + k);
-
-                // Iterate through all the particles in neighbor_id
-                ListNode* curr_node = bin_heads[neighbor_id];
-                while (curr_node != nullptr) {
-                    int particle_j_id = curr_node->particle_index;
-                    apply_force_gpu(particles[i], particles[particle_j_id]);
-                    curr_node = curr_node->next;
-                }
-            }
-        }
+    particle_t* p = &particles[tid];
+    p->ax = p->ay = 0;
+    for (int i = 0; i < num_parts; i++) {
+        apply_force_gpu(*p, particles[i]);
     }
 }
 
@@ -77,135 +51,88 @@ __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
 
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps = blockDim.x * gridDim.x;
+    if (tid >= num_parts)
+        return;
 
-    for (int i = tid; i < num_parts; i += steps) {
+    particle_t* p = &particles[tid];
+    //
+    //  slightly simplified Velocity Verlet integration
+    //  conserves energy better than explicit Euler method
+    //
+    p->vx += p->ax * dt;
+    p->vy += p->ay * dt;
+    p->x += p->vx * dt;
+    p->y += p->vy * dt;
 
-        particle_t* p = &particles[i];
-        //
-        //  slightly simplified Velocity Verlet integration
-        //  conserves energy better than explicit Euler method
-        //
-        p->vx += p->ax * dt;
-        p->vy += p->ay * dt;
-        p->x += p->vx * dt;
-        p->y += p->vy * dt;
-
-        //
-        //  bounce from walls
-        //
-        while (p->x < 0 || p->x > size) {
-            p->x = p->x < 0 ? -(p->x) : 2 * size - p->x;
-            p->vx = -(p->vx);
-        }
-        while (p->y < 0 || p->y > size) {
-            p->y = p->y < 0 ? -(p->y) : 2 * size - p->y;
-            p->vy = -(p->vy);
-        }
+    //
+    //  bounce from walls
+    //
+    while (p->x < 0 || p->x > size) {
+        p->x = p->x < 0 ? -(p->x) : 2 * size - p->x;
+        p->vx = -(p->vx);
+    }
+    while (p->y < 0 || p->y > size) {
+        p->y = p->y < 0 ? -(p->y) : 2 * size - p->y;
+        p->vy = -(p->vy);
     }
 }
 
-__global__ void initialize_linked_lists(ListNode** bin_heads, ListNode** bin_tails, int num_bins) {
-
-    // Get thread (particle) ID
+// count the number of particles per bin 
+__global__ void count_particles_per_bin(particle_t* particles, int num_parts, int* bin_counts, int bin_per_row, double size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps = blockDim.x * gridDim.x;
+    if (tid >= num_parts)
+        return;
 
-    // Initialize bin_heads and bin_tails to nullptr
-    for (int i = tid; i < num_bins; i += steps) {
-        bin_heads[i] = nullptr;
-        bin_tails[i] = nullptr;
-    }
+    int bin_x = particles[tid].x / size * bin_per_row;
+    int bin_y = particles[tid].y / size * bin_per_row;
+    int bin_id = bin_x + bin_y * bin_per_row;
+    atomicAdd(&bin_counts[bin_id], 1);
 }
 
-__global__ void insert_into_linked_list(ListNode** bin_heads, ListNode** bin_tails, int* bin_ids, int* particle_indices, int num_parts) {
-
-    // Get thread (particle) ID
+// assign particles to bins
+__global__ void assign_particles_to_bins(particle_t* particles, int num_parts, int* bin_ids, int* particle_ids, int* bin_counts, int bin_per_row, double size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps = blockDim.x * gridDim.x;
+    if (tid >= num_parts)
+        return;
 
-    for (int i = tid; i < num_parts; i += steps) {
-        int bin_id = bin_ids[i];
-        int particle_index = particle_indices[i];
-
-        ListNode* new_node = new ListNode;
-        new_node->particle_index = particle_index;
-        new_node->next = nullptr;
-
-        if (bin_heads[bin_id] == nullptr) {
-            // First node in the bin
-            bin_heads[bin_id] = new_node;
-            bin_tails[bin_id] = new_node;
-        } else {
-            bin_tails[bin_id]->next = new_node;
-            bin_tails[bin_id] = new_node;
-        }
-    }
+    int bin_x = particles[tid].x / size * bin_per_row;
+    int bin_y = particles[tid].y / size * bin_per_row;
+    int bin_id = bin_x + bin_y * bin_per_row;
+    int index = atomicAdd(&bin_counts[bin_id], 1);
+    bin_ids[bin_id] = index == 0 ? tid : bin_ids[bin_id];
+    particle_ids[index] = tid;
 }
 
-__global__ void compute_bin_ids(particle_t* particles, int* bin_ids, int num_parts, double size, int ROW_BLOCKS) {
-    // Get thread (particle) ID
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps = blockDim.x * gridDim.x;
-
-    for (int i = tid; i < num_parts; i += steps) {
-        // Get what row and column the particle would be in
-        int del_x = (particles[i].x * ROW_BLOCKS / size) + 1;
-        int del_y = (particles[i].y * ROW_BLOCKS / size) + 1;
-        // Get the bin id of the particle
-        int bin_id = del_x + (ROW_BLOCKS + 2) * del_y;
-        bin_ids[i] = bin_id;
-    }
-}
-
-void init_simulation(particle_t* particles, int num_parts, double size) {
-    // This function will be called once before the algorithm begins
-    // particles live in GPU memory
-    // Do not do any particle simulation here
-
+// initalize the simulation
+void init_simulation(particle_t* particles, int num_parts, double size){
     blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    bin_per_row = ceil(size / cutoff);
+    num_bins = bin_per_row * bin_per_row;
 
-    // num blocks in either x or y direction
-    ROW_BLOCKS = size / cutoff;
-    binCount = (ROW_BLOCKS) * (ROW_BLOCKS);
-
-    // Allocate memory for bin_heads and bin_tails on the GPU
-    cudaMalloc((void**)&bin_heads, binCount * sizeof(ListNode*));
-    cudaMalloc((void**)&bin_tails, binCount * sizeof(ListNode*));
-
-    // Initialize linked lists to nullptr
-    initialize_linked_lists<<<blks, NUM_THREADS>>>(bin_heads, bin_tails, binCount);
-
-    // Allocate memory for particle bin ids and indices on the GPU
-    int* d_bin_ids;
-    int* d_particle_indices;
-     cudaMalloc((void**)&d_bin_ids, num_parts * sizeof(int));
-    cudaMalloc((void**)&d_particle_indices, num_parts * sizeof(int));
-
-    // Calculate bin ids for each particle
-    compute_bin_ids<<<blks, NUM_THREADS>>>(particles, d_bin_ids, num_parts, size, ROW_BLOCKS);
-
-    // Copy particle indices to device
-    int* h_particle_indices = new int[num_parts];
-    for (int i = 0; i < num_parts; ++i) {
-        h_particle_indices[i] = i;
-    }
-    cudaMemcpy(d_particle_indices, h_particle_indices, num_parts * sizeof(int), cudaMemcpyHostToDevice);
-
-    // Insert particles into linked lists based on bin ids
-    insert_into_linked_list<<<blks, NUM_THREADS>>>(bin_heads, bin_tails, d_bin_ids, d_particle_indices, num_parts);
-
-    // Free temporary memory
-    cudaFree(d_bin_ids);
-    cudaFree(d_particle_indices);
-    delete[] h_particle_indices;
+    // Allocate memory for bin_ids, particle_ids, and bin_counts
+    cudaMalloc((void**)&bin_ids, num_bins * sizeof(int));
+    cudaMalloc((void**)&particle_ids, num_parts * sizeof(int));
+    cudaMalloc((void**)&bin_counts, num_bins * sizeof(int));
 }
 
-void simulate_one_step(particle_t* particles, int num_parts, double size) {
-    // particles live in GPU memory
+// Perform the simulation
+void simulate_one_step(particle_t* particles, int num_parts, double size){
+
+    // Reset bin_counts
+    cudaMemset(bin_counts, 0, num_bins * sizeof(int));
+
+    // Count the number of particles per bin
+    count_particles_per_bin<<<blks, NUM_THREADS>>>(particles, num_parts, bin_counts, bin_per_row, size);
+
+    // Perform exclusive scan on bin_counts
+    thrust::device_ptr<int> dev_bin_counts(bin_counts);
+    thrust::exclusive_scan(dev_bin_counts, dev_bin_counts + num_bins, dev_bin_counts);
+
+    // Assign particles to bins
+    assign_particles_to_bins<<<blks, NUM_THREADS>>>(particles, num_parts, bin_ids, particle_ids, bin_counts, bin_per_row, size);
 
     // Compute forces
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(particles, bin_heads, bin_tails, num_parts, size, ROW_BLOCKS);
+    compute_forces_gpu<<<blks, NUM_THREADS>>>(particles, num_parts);
 
     // Move particles
     move_gpu<<<blks, NUM_THREADS>>>(particles, num_parts, size);
