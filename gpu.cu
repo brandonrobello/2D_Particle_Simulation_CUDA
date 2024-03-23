@@ -3,18 +3,29 @@
 #include <iostream>
 #include <thrust/scan.h>
 #include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
 
 #define NUM_THREADS 256
 
-// Put any static global variables here that you will use throughout the simulation.
-int blks;
-static int bin_per_row; 
+// static global variables 
+int blks; 
+int bin_per_row; 
 int num_bins;
+int bin_size;
 
-// Initialize long arrays for particle and bins 
-int* bin_ids; // store the index of the first particle in this bin 
-int* particle_ids;  // stores all the particles in a array 
-int* bin_counts; // store the number of particles in each bin
+
+int* particle_ids;  // array for sorted particles 
+int* bin_ids;       // array containing the index of the first particle that is stored in it 
+int* bin_counts;    // array containing the number of particles in each bin
+
+
+// Function to set an array to zeros 
+__global__ void set_to_zero(int* arr, int size) {
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    if (tid >= size)
+        return;
+    arr[tid] = 0;
+}
 
 __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     double dx = neighbor.x - particle.x;
@@ -34,17 +45,40 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
     particle.ay += coef * dy;
 }
 
-__global__ void compute_forces_gpu(particle_t* particles, int num_parts) {
+__global__ void compute_forces_gpu(particle_t* particles, int num_parts, int* particle_ids, int* bin_ids, int* bin_counts, int num_bins, double bin_size) {
     // Get thread (particle) ID
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= num_parts)
-        return; 
+        return;
 
-    particle_t* p = &particles[tid];
-    p->ax = p->ay = 0;
-    for (int i = 0; i < num_parts; i++) {
-        apply_force_gpu(*p, particles[i]);
+    // set the acceleration to zero
+    particles[tid].ax = particles[tid].ay = 0;
+    // find the bin index for the particles 
+    int part_x = particles[tid].x / bin_size;
+    int part_y = particles[tid].y / bin_size;
+
+    // loop over the neighboring bins 
+    for (int i = -1; i <= 1; i++) {
+        for (int j = -1; j <= 1; j++) {
+
+            // find the bin index 
+            int bin_x = part_x + i;
+            int bin_y = part_y + j;
+
+            // check if the bin is within the grid 
+            if (bin_x >= 0 && bin_x < num_bins && bin_y >= 0 && bin_y < num_bins) {
+                int index = bin_x + bin_y * num_bins;
+                int start = bin_ids[index];
+                int end = start + bin_counts[index];
+
+                // loop over the particles in the bin 
+                for (int k = start; k < end; k++) {
+                    apply_force_gpu(particles[tid], particles[particle_ids[k]]);
+                }
+            }
+        }
     }
+
 }
 
 __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
@@ -77,63 +111,74 @@ __global__ void move_gpu(particle_t* particles, int num_parts, double size) {
     }
 }
 
-// count the number of particles per bin 
-__global__ void count_particles_per_bin(particle_t* particles, int num_parts, int* bin_counts, int bin_per_row, double size) {
+// Function to update the number of particles per bin using atomicAdd 
+__global__ void update_bin_counts_gpu(particle_t* parts, int num_parts, int* bin_counts, int num_bins, double bin_size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= num_parts)
         return;
 
-    int bin_x = particles[tid].x / size * bin_per_row;
-    int bin_y = particles[tid].y / size * bin_per_row;
-    int bin_id = bin_x + bin_y * bin_per_row;
-    atomicAdd(&bin_counts[bin_id], 1);
+    int part_x = parts[tid].x / bin_size;
+    int part_y = parts[tid].y / bin_size;
+    int index = part_x + part_y * num_bins;
+    atomicAdd(&bin_counts[index], 1);
 }
 
-// assign particles to bins
-__global__ void assign_particles_to_bins(particle_t* particles, int num_parts, int* bin_ids, int* particle_ids, int* bin_counts, int bin_per_row, double size) {
+// Function to update particle_ids array 
+__global__ void update_particle_ids_gpu(particle_t* parts, int num_parts, int* particle_ids, int* bin_ids, int num_bins, int bin_size) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid >= num_parts)
         return;
 
-    int bin_x = particles[tid].x / size * bin_per_row;
-    int bin_y = particles[tid].y / size * bin_per_row;
-    int bin_id = bin_x + bin_y * bin_per_row;
-    int index = atomicAdd(&bin_counts[bin_id], 1);
-    bin_ids[bin_id] = index == 0 ? tid : bin_ids[bin_id];
-    particle_ids[index] = tid;
+    int part_x = parts[tid].x / bin_size;
+    int part_y = parts[tid].y / bin_size;
+    int index = part_x + part_y * num_bins;
+    int bin_id = atomicAdd(&bin_ids[index], 1);
+    particle_ids[bin_id] = tid;
+
 }
 
-// initalize the simulation
-void init_simulation(particle_t* particles, int num_parts, double size){
+void init_simulation(particle_t* parts, int num_parts, double size) {
+    // You can use this space to initialize data objects that you may need
+    // This function will be called once before the algorithm begins
+    // parts live in GPU memory
+    // Do not do any particle simulation here
+
     blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
-    bin_per_row = ceil(size / cutoff);
-    num_bins = bin_per_row * bin_per_row;
+    num_bins = ceil(size / cutoff);
+    bin_size = size / num_bins;
 
-    // Allocate memory for bin_ids, particle_ids, and bin_counts
-    cudaMalloc((void**)&bin_ids, num_bins * sizeof(int));
-    cudaMalloc((void**)&particle_ids, num_parts * sizeof(int));
-    cudaMalloc((void**)&bin_counts, num_bins * sizeof(int));
+    // Allocate memory for particle_ids, bin_ids, and bin_counts
+    cudaMalloc(&particle_ids, num_parts * sizeof(int));
+    cudaMalloc(&bin_ids, num_bins * num_bins * sizeof(int));
+    cudaMalloc(&bin_counts, num_bins * num_bins * sizeof(int));
+
+    // Set particle_ids, bin_ids, and bin_counts to zero
+    set_to_zero<<<blks, NUM_THREADS>>>(particle_ids, num_parts);
+    set_to_zero<<<blks, NUM_THREADS>>>(bin_ids, num_bins * num_bins);
+    set_to_zero<<<blks, NUM_THREADS>>>(bin_counts, num_bins * num_bins);
 }
 
-// Perform the simulation
-void simulate_one_step(particle_t* particles, int num_parts, double size){
+void simulate_one_step(particle_t* parts, int num_parts, double size) {
+    // parts live in GPU memory
+    // Rewrite this function
+    set_to_zero<<<blks, NUM_THREADS>>>(bin_counts, num_bins * num_bins);
+    set_to_zero<<<blks, NUM_THREADS>>>(bin_ids, num_bins * num_bins);
 
-    // Reset bin_counts
-    cudaMemset(bin_counts, 0, num_bins * sizeof(int));
-
-    // Count the number of particles per bin
-    count_particles_per_bin<<<blks, NUM_THREADS>>>(particles, num_parts, bin_counts, bin_per_row, size);
+    // Update bin_counts and particle_ids
+    update_bin_counts_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, bin_counts, num_bins, bin_size);
 
     // Perform exclusive scan on bin_counts
-    thrust::device_ptr<int> dev_bin_counts(bin_counts);
-    thrust::exclusive_scan(dev_bin_counts, dev_bin_counts + num_bins, dev_bin_counts);
+    thrust::exclusive_scan(thrust::device, bin_counts, bin_counts + num_bins * num_bins, bin_ids);
 
-    // Assign particles to bins
-    assign_particles_to_bins<<<blks, NUM_THREADS>>>(particles, num_parts, bin_ids, particle_ids, bin_counts, bin_per_row, size);
+    // Copy the result back to bin_counts
+    cudaMemcpy(bin_counts, bin_ids, num_bins * num_bins * sizeof(int), cudaMemcpyDeviceToDevice);
+
+    // Update particle_ids
+    update_particle_ids_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, particle_ids, bin_ids, num_bins, bin_size);
 
     // Compute forces
-    compute_forces_gpu<<<blks, NUM_THREADS>>>(particles, num_parts);
+    compute_forces_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, particle_ids, bin_ids, bin_counts, num_bins, bin_size);
 
     // Move particles
-    move_gpu<<<blks, NUM_THREADS>>>(particles, num_parts, size);
+    move_gpu<<<blks, NUM_THREADS>>>(parts, num_parts, size);
 }
